@@ -26,7 +26,7 @@ cargo build --locked --release --bin csp-kiss
 target/release/csp-kiss --device /dev/pts/7 ping --node 1 --count 5
 target/release/csp-kiss --device /dev/pts/7 ifstat --node 1 --interface KISS
 target/release/csp-kiss --device /dev/pts/7 logs --node 1 --output logs.jsonl
-target/release/csp-kiss --device /dev/pts/7 neighbors --nodes 1,2 --output nodes.jsonl
+target/release/csp-kiss --device /dev/pts/7 discover --nodes 1,2 --output nodes.jsonl
 target/release/csp-kiss --device /dev/pts/7 dump --seconds 10 --pcap-file traffic.pcap
 ```
 
@@ -45,7 +45,7 @@ the command and leaves partial output. `text_hex` retains the exact bytes;
 `text` decodes UTF-8 with replacement. History is RAM-only and reads do not
 consume it. The global `--timeout-ms` bounds the entire transfer.
 
-`neighbors` pings an explicit list or `--range first:last`, then requests CMP
+`discover` pings an explicit list or `--range first:last`, then requests CMP
 identity. Lists/ranges are limited to 64 unicast addresses and must exclude
 the local source address and 16383. `--budget-ms` (default 5000) bounds the
 whole run, while `--timeout-ms` bounds each exchange. Results distinguish

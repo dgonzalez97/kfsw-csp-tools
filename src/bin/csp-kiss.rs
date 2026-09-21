@@ -13,10 +13,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "csp-kiss/discover.rs"]
+mod discover;
 #[path = "csp-kiss/history.rs"]
 mod history;
-#[path = "csp-kiss/neighbors.rs"]
-mod neighbors;
 
 /// CSP 2 diagnostics on a libcsp KISS serial device or native_sim PTY.
 #[derive(Parser)]
@@ -38,7 +38,7 @@ enum Command {
     /// Retrieve recent K-FSW text logs as JSON lines.
     Logs(history::Args),
     /// Query a bounded list of CSP nodes and save their identities as JSON lines.
-    Neighbors(neighbors::Args),
+    Discover(discover::Args),
     /// Measure ping round trips. A missing or corrupted reply fails the run.
     Ping {
         #[arg(long, value_parser = clap::value_parser!(u16).range(0..16384))]
@@ -173,7 +173,7 @@ fn print_ifstat(payload: &[u8], interface: &str) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     match &args.command {
-        Command::Neighbors(options) => {
+        Command::Discover(options) => {
             options.nodes(args.source)?;
         }
         Command::Logs(options) => ensure!(
@@ -192,8 +192,8 @@ fn main() -> Result<()> {
         Command::Logs(options) => {
             history::run(&mut *port, &mut decoder, args.source, timeout, options)?
         }
-        Command::Neighbors(options) => {
-            neighbors::run(&mut *port, &mut decoder, args.source, timeout, options)?
+        Command::Discover(options) => {
+            discover::run(&mut *port, &mut decoder, args.source, timeout, options)?
         }
         Command::Ping { node, count, size } => {
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
