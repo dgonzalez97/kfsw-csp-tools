@@ -13,6 +13,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "csp-kiss/history.rs"]
+mod history;
+#[path = "csp-kiss/neighbors.rs"]
+mod neighbors;
+
 /// CSP 2 diagnostics on a libcsp KISS serial device or native_sim PTY.
 #[derive(Parser)]
 struct Args {
@@ -30,6 +35,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Retrieve recent K-FSW text logs as JSON lines.
+    Logs(history::Args),
+    /// Query a bounded list of CSP nodes and save their identities as JSON lines.
+    Neighbors(neighbors::Args),
     /// Measure ping round trips. A missing or corrupted reply fails the run.
     Ping {
         #[arg(long, value_parser = clap::value_parser!(u16).range(0..16384))]
@@ -63,6 +72,12 @@ fn receive(
 ) -> Result<Option<Packet>> {
     let mut byte = [0u8; 1];
     while Instant::now() < deadline {
+        port.set_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50))
+                .max(Duration::from_millis(1)),
+        )?;
         match port.read(&mut byte) {
             Ok(0) => anyhow::bail!("serial device closed"),
             Ok(_) => {
@@ -95,6 +110,15 @@ fn exchange(
     let deadline = Instant::now() + timeout;
     port.write_all(&request.encode())?;
     port.flush()?;
+    receive_reply(port, decoder, request, deadline)?.context("no matching reply before timeout")
+}
+
+fn receive_reply(
+    port: &mut dyn SerialPort,
+    decoder: &mut Decoder,
+    request: &Packet,
+    deadline: Instant,
+) -> Result<Option<Packet>> {
     while let Some(reply) = receive(port, decoder, deadline)? {
         if reply.source() == request.destination()
             && reply.destination() == request.source()
@@ -102,10 +126,24 @@ fn exchange(
             && reply.destination_port() == request.source_port()
             && reply.flags() == 1
         {
-            return Ok(reply);
+            return Ok(Some(reply));
         }
     }
-    anyhow::bail!("no matching reply before timeout")
+    Ok(None)
+}
+
+fn json_line(output: &mut dyn io::Write, value: &serde_json::Value) -> Result<()> {
+    serde_json::to_writer(&mut *output, value)?;
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
+}
+
+fn output_file(path: &Option<PathBuf>) -> Result<Box<dyn io::Write>> {
+    Ok(match path {
+        Some(path) => Box::new(OpenOptions::new().write(true).create_new(true).open(path)?),
+        None => Box::new(io::stdout()),
+    })
 }
 
 fn print_ifstat(payload: &[u8], interface: &str) -> Result<()> {
@@ -134,6 +172,16 @@ fn print_ifstat(payload: &[u8], interface: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    match &args.command {
+        Command::Neighbors(options) => {
+            options.nodes(args.source)?;
+        }
+        Command::Logs(options) => ensure!(
+            options.node != args.source,
+            "source and destination must differ"
+        ),
+        _ => {}
+    }
     let timeout = Duration::from_millis(u64::from(args.timeout_ms));
     let mut port = serialport::new(&args.device, args.baud)
         .timeout(Duration::from_millis(50).min(timeout))
@@ -141,6 +189,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening {}", args.device))?;
     let mut decoder = Decoder::default();
     match args.command {
+        Command::Logs(options) => {
+            history::run(&mut *port, &mut decoder, args.source, timeout, options)?
+        }
+        Command::Neighbors(options) => {
+            neighbors::run(&mut *port, &mut decoder, args.source, timeout, options)?
+        }
         Command::Ping { node, count, size } => {
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
             for sequence in 0..count {

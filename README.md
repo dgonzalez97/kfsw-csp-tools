@@ -25,6 +25,8 @@ link. The original CAN/ZMQ tools below remain CSP 1 tools.
 cargo build --locked --release --bin csp-kiss
 target/release/csp-kiss --device /dev/pts/7 ping --node 1 --count 5
 target/release/csp-kiss --device /dev/pts/7 ifstat --node 1 --interface KISS
+target/release/csp-kiss --device /dev/pts/7 logs --node 1 --output logs.jsonl
+target/release/csp-kiss --device /dev/pts/7 neighbors --nodes 1,2 --output nodes.jsonl
 target/release/csp-kiss --device /dev/pts/7 dump --seconds 10 --pcap-file traffic.pcap
 ```
 
@@ -33,6 +35,28 @@ baud rate to 115200. Node addresses span 0..16383. Ping verifies the entire
 reply and fails on loss. CMP statistics require a known interface name of at
 most ten bytes; unknown interfaces time out. Only one process can own the
 serial link at a time.
+
+`logs` reads the last 1–32 K-FSW messages (`--count`, default 32), filtered by
+`--min-level` (0 debug through 3 error). The node needs K-FSW log history and
+its CSP server, on port 13 unless overridden with `logs --port`. Each JSONL
+capture contains start/log/end records. Check the final `complete` field:
+packet loss, a busy writer overwriting requested history, or a timeout fails
+the command and leaves partial output. `text_hex` retains the exact bytes;
+`text` decodes UTF-8 with replacement. History is RAM-only and reads do not
+consume it. The global `--timeout-ms` bounds the entire transfer.
+
+`neighbors` pings an explicit list or `--range first:last`, then requests CMP
+identity. Lists/ranges are limited to 64 unicast addresses and must exclude
+the local source address and 16383. `--budget-ms` (default 5000) bounds the
+whole run, while `--timeout-ms` bounds each exchange. Results distinguish
+identified nodes, reachable nodes without identity, invalid ping replies,
+no reply and nodes not queried before the deadline. An unanswered node does
+not fail an otherwise complete inventory; an expired budget with remaining
+nodes does. It follows configured CSP routes and does not implement IP ARP.
+
+Both commands write JSON lines to stdout or an exclusive-create `--output`
+file. Every record is flushed. Interrupted commands leave partial output
+without a successful final marker. Neither command changes node clocks.
 
 Dump sends nothing, records the node's outgoing traffic, and fails on an empty
 capture. Trigger traffic through the node's console or configure HK beacons.
