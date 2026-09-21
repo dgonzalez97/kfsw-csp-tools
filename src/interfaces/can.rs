@@ -2,9 +2,7 @@ use super::Interface;
 use crate::csp::{CSP_CRC_SIZE, CSP_HEADER_SIZE, Header, Packet};
 use anyhow::{Context, Result};
 use deku::prelude::*;
-use socketcan::{
-    BlockingCan, CanFilter, CanFrame, CanSocket, EmbeddedFrame, ExtendedId, Id, Socket,
-};
+use socketcan::{CanFilter, CanFrame, CanSocket, EmbeddedFrame, ExtendedId, Id, Socket};
 use std::collections::{HashMap, hash_map::Entry};
 
 /// CSP CAN interface.
@@ -76,13 +74,39 @@ impl<Callback> CanInterface<Callback> {
     }
 }
 
+impl<Callback: CallbackFn> CanInterface<Callback> {
+    /// Make frame reads and writes nonblocking.
+    pub fn set_nonblocking(&self) -> Result<()> {
+        self.socket.set_nonblocking(true)?;
+        Ok(())
+    }
+
+    /// Poll one CAN frame without waiting for complete reassembly.
+    pub fn try_receive(&mut self) -> Result<Option<Packet>> {
+        let frame = match self.socket.read_frame() {
+            Ok(frame) => frame,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Id::Extended(identifier) = frame.id() else {
+            return Ok(None);
+        };
+        self.can_frame_callback.call(&frame)?;
+        Ok(self
+            .defragmenter
+            .defragment(CanIdentifier::deserialize(identifier), frame.data())
+            .ok()
+            .flatten())
+    }
+}
+
 impl<Callback: CallbackFn> Interface for CanInterface<Callback> {
     fn send(&mut self, packet: &Packet) -> Result<()> {
         for frame in cfp_fragments(packet, self.tx_fragmentation_identifier)
             .context("Failed to fragment CSP packet using CFP")?
         {
             self.socket
-                .transmit(&frame)
+                .write_frame(&frame)
                 .context("Failed to send CFP fragment to CAN interface")?;
         }
         self.tx_fragmentation_identifier = (self.tx_fragmentation_identifier + 1) % (1 << 10);
@@ -303,6 +327,7 @@ impl CfpDefragmenter {
                 "CFP defragmented length does not match length field"
             );
             if packet.header.flags.crc {
+                anyhow::ensure!(packet.payload.len() >= CSP_CRC_SIZE, "missing CSP CRC");
                 let crc_offset = packet.payload.len() - CSP_CRC_SIZE;
                 let (payload, crc) = packet.payload.split_at(crc_offset);
                 anyhow::ensure!(
@@ -322,6 +347,23 @@ impl CfpDefragmenter {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn truncated_crc_does_not_panic() {
+        let identifier = CanIdentifier {
+            source_address: 22,
+            destination_address: 23,
+            fragment_type: FragmentType::Begin,
+            remain: 0,
+            fragmentation_identifier: 0,
+        };
+        let mut defragmenter = CfpDefragmenter::default();
+        assert!(
+            defragmenter
+                .defragment(identifier, &[0xac, 0xa0, 0x79, 0x01, 0, 1, 0])
+                .is_err()
+        );
+    }
 
     #[test]
     fn serialize_identifier() {

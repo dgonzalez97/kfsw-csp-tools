@@ -59,6 +59,24 @@ pub enum CspInterface<Callback = ()> {
     Zmq(ZmqInterface),
 }
 
+impl<Callback: can::CallbackFn> CspInterface<Callback> {
+    /// Set bounded writes and enable nonblocking receives.
+    pub fn set_nonblocking(&self) -> Result<()> {
+        match self {
+            Self::Can(can) => can.set_nonblocking(),
+            Self::Zmq(zmq) => zmq.set_nonblocking(),
+        }
+    }
+
+    /// Poll one frame or packet; malformed traffic is discarded.
+    pub fn try_receive(&mut self) -> Result<Option<Packet>> {
+        match self {
+            Self::Can(can) => can.try_receive(),
+            Self::Zmq(zmq) => zmq.try_receive(),
+        }
+    }
+}
+
 impl<Callback: can::CallbackFn> Interface for CspInterface<Callback> {
     fn send(&mut self, packet: &Packet) -> Result<()> {
         match self {

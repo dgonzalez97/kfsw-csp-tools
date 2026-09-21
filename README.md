@@ -10,7 +10,7 @@ The tools included are:
   socket or a CAN interface and writes them to a PCAP file.
 
 - `csp-iperf`. A tool similar to `iperf`. It sends CSP packets through a ZMQ
-  socket or a CAN interface, expects these packets to be replied by a ping
+  socket, CAN interface or CSP 2 KISS device, expects a reply from a ping
   service, and measures throughput, RTT and lost packets.
 
 - `csp-ping-server`. A tool that implements a ping service. It can be used in
@@ -67,6 +67,55 @@ is not a decoder for these captures.
 
 `cargo test --locked` checks framing, CRCs, address bounds and CMP validation.
 K-FSW's `tests/diagnostics-smoke.py` additionally exercises real native_sim PTYs.
+
+## CSP echo benchmark
+
+```bash
+cargo build --locked --release --bin csp-iperf
+target/release/csp-iperf --device /dev/pts/7 --dest-addr 1 \
+  --packet-size 64 --tx-rate 640 --duration 10 --reply-timeout 1 --json
+```
+
+`--device` (alias `--kiss`) selects CSP 2 with both CSP and KISS CRC32C.
+Without it, `--can` and the original `--zmq-tx-socket`/`--zmq-rx-socket`
+options retain CSP 1. K-FSW's built-in ping service on port 1 is sufficient;
+no extra server or clock synchronization is needed. The source defaults to
+30 and must be unused. Broadcast addresses are rejected. CAN remains a CSP 1
+transport, not a direct adapter to K-FSW's CSP 2 CAN interface.
+
+Runs now stop after `--duration` (default 10 seconds) plus `--reply-timeout`
+(default 1 second). This replaces the original unlimited run. Sizes include
+CSP headers and CRC, but exclude transport framing. At least 16 payload bytes
+are required for a random run ID and sequence. `--tx-rate` is offered CSP
+bytes/second, not bits/second. `--rx-rate` instead derives a request rate from
+`--reply-size`; a different reply size requires a correspondingly configured
+`csp-ping-server`. The built-in K-FSW service echoes the request size.
+
+Each unique reply must match both addresses, both ports, CRC mode, transaction
+ID and the entire expected payload. RTT uses host monotonic time. Reordering
+does not create loss, and duplicates do not increase throughput. Final loss
+is sent minus unique replies within each request's timeout, including silence
+and trailing loss. Late replies remain lost. `ignored` counts decoded replies
+that fail matching; malformed transport frames and bad CRCs are discarded
+before this counter. `late` and `duplicates` count received events.
+
+The final JSON reports sent/received/lost, duplicates, reordering, late and
+ignored replies, RTT milliseconds and actual CSP/payload byte rates. TX rate
+uses the requested sending window; RX rates include the final drain interval
+(`elapsed_seconds`). Transport escaping/framing is not part of those rates.
+Progress goes to stderr. Exit status is 0 for no loss, 2 for measured loss,
+and 1 for runtime/validation errors (CLI syntax errors also use 2).
+
+Sending is paced without catch-up bursts. Actual rate can be lower than the
+offered rate under link or host load. Runs are capped at one million requests
+and one hour of sending; invalid/nonfinite rates fail before opening a device.
+A send or receive I/O failure aborts the run instead of leaving worker threads
+alive. These results are echo measurements, not a calibrated link-capacity
+measurement. The PTY does not model physical serial baud limits.
+
+Software regressions and the native/bench fixture live in the K-FSW application
+branch: `tests/ground/test_csp_iperf.py`, `tests/csp-iperf-smoke.py`, and
+`tests/hil/csp-iperf.robot`. Physical KISS and CAN verification remains pending.
 
 ## Wireshark dissector
 

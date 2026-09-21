@@ -73,6 +73,24 @@ impl ZmqInterface {
     }
 }
 
+impl ZmqInterface {
+    /// Bound writes; receive polling uses ZMQ_DONTWAIT.
+    pub fn set_nonblocking(&self) -> Result<()> {
+        self.socket.set_sndtimeo(1000)?;
+        self.socket.set_linger(0)?;
+        Ok(())
+    }
+
+    /// Poll one packet, discarding malformed CSP frames.
+    pub fn try_receive(&mut self) -> Result<Option<Packet>> {
+        match self.socket.recv_bytes(zmq::DONTWAIT) {
+            Ok(bytes) => Ok(deserialize_zmq(&bytes).ok()),
+            Err(zmq::Error::EAGAIN) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 impl Interface for ZmqInterface {
     fn send(&mut self, packet: &Packet) -> Result<()> {
         let flags = 0;

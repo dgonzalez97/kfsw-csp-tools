@@ -1,452 +1,508 @@
-use anyhow::Result;
-use bandwidth::Bandwidth;
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use csp_tools::{
-    csp::{CSP_CRC_SIZE, CSP_HEADER_SIZE, Flags, Header, PING_PORT, Packet, Priority},
+    csp::{Flags, Header, Packet, Priority},
     interfaces::{CspInterface, Interface, open_csp_interfaces},
+    kiss,
 };
+use serde_json::json;
 use std::{
-    cmp::Ordering,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering::Relaxed},
-    },
-    time::{Duration, Instant, SystemTime},
+    io::{Read, Write},
+    time::{Duration, Instant},
 };
 
-/// iperf-like tool using CSP.
-#[derive(Parser, Debug, Clone, PartialEq)]
-#[command(version, about, long_about = None)]
+/// Measure CSP echo throughput with validated replies and bounded runtime.
+#[derive(Parser, Debug)]
 struct Args {
-    /// CAN interface (if not specified, ZMQ is used instead).
+    /// CSP 2 KISS serial device (CSP 1 is used for CAN and ZMQ).
+    #[arg(long, alias = "kiss", conflicts_with = "can")]
+    device: Option<String>,
+    #[arg(long, default_value_t = 115200)]
+    baud: u32,
     #[arg(long)]
     can: Option<String>,
-    /// ZMQ socket to which frames are sent.
     #[arg(long, default_value = "tcp://127.0.0.1:6000")]
     zmq_tx_socket: String,
-    /// ZMQ socket from which frames are received.
     #[arg(long, default_value = "tcp://127.0.0.1:7000")]
     zmq_rx_socket: String,
-    /// CSP source address.
-    #[arg(long, value_parser=clap::value_parser!(u8).range(..32))]
-    src_addr: u8,
-    /// CSP source port (default is select and auto-increment outgoing port).
-    #[arg(long, value_parser=clap::value_parser!(u8).range(..64))]
-    src_port: Option<u8>,
-    /// CSP destination address.
-    #[arg(long, value_parser=clap::value_parser!(u8).range(..32))]
-    dest_addr: u8,
-    /// CSP destination port (default is CSP ping port).
-    #[arg(long, default_value_t = PING_PORT, value_parser=clap::value_parser!(u8).range(..64))]
-    dest_port: u8,
-    /// Via address (by default use the CSP destination address).
-    #[arg(long, value_parser=clap::value_parser!(u8).range(..32))]
-    via_addr: Option<u8>,
-    /// CSP packet size for request packets.
+    #[arg(long, default_value_t = 30)]
+    src_addr: u16,
     #[arg(long)]
+    src_port: Option<u8>,
+    #[arg(long, alias = "node")]
+    dest_addr: u16,
+    #[arg(long, default_value_t = 1)]
+    dest_port: u8,
+    #[arg(long)]
+    via_addr: Option<u8>,
+    /// Total CSP bytes, including header and CSP CRC, excluding transport framing.
+    #[arg(long, default_value_t = 64)]
     packet_size: usize,
-    /// CSP packet size for replies (default is the same as request size). This
-    /// option is intended to be used with a ping server that modifies the reply
-    /// size to achieve asymmetric rate.
+    /// Expected total reply size; requires a matching csp-ping-server setting.
     #[arg(long)]
     reply_size: Option<usize>,
-    /// CSP maximum bindable ports (used to select outgoing ports).
-    #[arg(long, default_value_t = 16, value_parser=clap::value_parser!(u8).range(..64))]
+    #[arg(long, default_value_t = 16)]
     csp_port_max_bind: u8,
-    #[command(flatten)]
-    rate: Rate,
-    /// Period used to print statistics (in seconds).
+    /// Offered CSP bytes per second.
+    #[arg(long, conflicts_with = "rx_rate", required_unless_present = "rx_rate")]
+    tx_rate: Option<f64>,
+    /// Expected reply CSP bytes per second, converted to a request rate.
+    #[arg(long, conflicts_with = "tx_rate")]
+    rx_rate: Option<f64>,
+    #[arg(long, default_value_t = 10.0)]
+    duration: f64,
+    /// Maximum RTT in seconds; also bounds the final receive drain.
+    #[arg(long, default_value_t = 1.0)]
+    reply_timeout: f64,
     #[arg(long, default_value_t = 1.0)]
     stats_period: f64,
-    /// Do not use CRC.
+    /// Disable CSP CRC on legacy CAN/ZMQ only.
     #[arg(long)]
     no_crc: bool,
-}
-
-#[derive(clap::Args)]
-#[group(required = true, multiple = false)]
-#[derive(Debug, Copy, Clone, PartialEq)]
-struct Rate {
-    /// Throttle TX rate to this speed (in bits per second).
+    /// Print the final result as JSON on stdout.
     #[arg(long)]
-    tx_rate: Option<f64>,
-    /// Throttle RX rate to this speed (in bits per second). This option is
-    /// intended to be used with --reply-size and a ping server that modifies
-    /// the reply size to achieve asymmetric rate.
-    #[arg(long)]
-    rx_rate: Option<f64>,
+    json: bool,
 }
 
 impl Args {
     fn overhead(&self) -> usize {
-        CSP_HEADER_SIZE + if self.no_crc { 0 } else { CSP_CRC_SIZE }
-    }
-
-    fn tx_rate(&self) -> f64 {
-        if let Some(tx_rate) = self.rate.tx_rate {
-            return tx_rate;
-        }
-        // unwrap should not fail, because the options are mutually exclusive
-        // but required (exactly one needs to be set)
-        let rx_rate = self.rate.rx_rate.unwrap();
-        if let Some(reply_size) = self.reply_size {
-            self.packet_size as f64 * rx_rate / reply_size as f64
+        if self.device.is_some() {
+            10
         } else {
-            rx_rate
+            4 + usize::from(!self.no_crc) * 4
         }
     }
 
-    fn request_has_timestamp(&self) -> bool {
-        self.packet_size - self.overhead() >= std::mem::size_of::<u64>()
+    fn reply_size(&self) -> usize {
+        self.reply_size.unwrap_or(self.packet_size)
     }
 
-    fn request_has_sequence_number(&self) -> bool {
-        self.packet_size - self.overhead() >= 2 * std::mem::size_of::<u64>()
+    fn rate(&self) -> f64 {
+        self.tx_rate.unwrap_or_else(|| {
+            self.rx_rate.unwrap() * self.packet_size as f64 / self.reply_size() as f64
+        })
+    }
+
+    fn source_port(&self, sequence: usize) -> u8 {
+        self.src_port.unwrap_or_else(|| {
+            self.csp_port_max_bind + (sequence % usize::from(64 - self.csp_port_max_bind)) as u8
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let address_limit = if self.device.is_some() { 16384 } else { 32 };
+        ensure!(
+            self.src_addr < address_limit - 1 && self.dest_addr < address_limit - 1,
+            "source and destination must be unicast addresses within the transport range"
+        );
+        ensure!(
+            self.src_addr != self.dest_addr,
+            "source and destination must differ"
+        );
+        ensure!(
+            self.src_port.is_none_or(|port| port < 64)
+                && self.dest_port < 64
+                && self.csp_port_max_bind < 64,
+            "ports must be below 64"
+        );
+        ensure!(
+            self.via_addr.is_none_or(|addr| addr < 32),
+            "via address must be below 32"
+        );
+        ensure!(
+            self.device.is_none() || (!self.no_crc && self.via_addr.is_none()),
+            "KISS requires CRC and does not use --via-addr"
+        );
+        ensure!(self.baud > 0, "baud must be positive");
+        let maximum = if self.can.is_some() {
+            2042
+        } else {
+            kiss::MAX_FRAME - 4
+        };
+        for size in [self.packet_size, self.reply_size()] {
+            ensure!(
+                (self.overhead() + 16..=maximum).contains(&size),
+                "packet and reply sizes must hold a 16-byte transaction ID and fit the transport"
+            );
+        }
+        for (name, value) in [
+            ("duration", self.duration),
+            ("reply-timeout", self.reply_timeout),
+            ("stats-period", self.stats_period),
+        ] {
+            ensure!(
+                value.is_finite() && (0.001..=3600.0).contains(&value),
+                "{name} must be between 0.001 and 3600 seconds"
+            );
+        }
+        let rate = self.rate();
+        ensure!(
+            rate.is_finite() && rate > 0.0,
+            "rate must be finite and positive"
+        );
+        let interval = self.packet_size as f64 / rate;
+        ensure!(
+            interval.is_finite() && (0.000001..=3600.0).contains(&interval),
+            "packet interval must be between 1 microsecond and 3600 seconds"
+        );
+        ensure!(
+            (self.duration / interval).ceil() <= 1_000_000.0,
+            "run exceeds one million packets; lower rate or duration"
+        );
+        Ok(())
     }
 }
 
-#[derive(Debug)]
+struct Reply {
+    source: u16,
+    destination: u16,
+    sport: u8,
+    dport: u8,
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+enum Transport {
+    Kiss {
+        port: Box<dyn serialport::SerialPort>,
+        decoder: kiss::Decoder,
+    },
+    Legacy {
+        tx: CspInterface,
+        rx: CspInterface,
+    },
+}
+
+impl Transport {
+    fn open(args: &Args) -> Result<Self> {
+        if let Some(device) = &args.device {
+            let port = serialport::new(device, args.baud)
+                .timeout(Duration::from_millis(1000))
+                .open()?;
+            Ok(Self::Kiss {
+                port,
+                decoder: kiss::Decoder::default(),
+            })
+        } else {
+            let (tx, rx) = open_csp_interfaces(
+                args.can.as_deref(),
+                &args.zmq_tx_socket,
+                &args.zmq_rx_socket,
+                args.src_addr as u8,
+            )?;
+            tx.set_nonblocking()?;
+            rx.set_nonblocking()?;
+            // Allow ZMQ subscriptions to propagate before starting the measurement.
+            if args.can.is_none() {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Ok(Self::Legacy { tx, rx })
+        }
+    }
+
+    fn send(&mut self, args: &Args, sequence: usize, payload: &[u8]) -> Result<()> {
+        match self {
+            Self::Kiss { port, .. } => {
+                let packet = kiss::Packet::request(
+                    args.src_addr,
+                    args.dest_addr,
+                    args.source_port(sequence),
+                    args.dest_port,
+                    payload,
+                )?;
+                port.write_all(&packet.encode())?;
+            }
+            Self::Legacy { tx, .. } => tx.send(&Packet {
+                via: args.via_addr,
+                header: Header {
+                    priority: Priority::Normal,
+                    source_address: args.src_addr as u8,
+                    destination_address: args.dest_addr as u8,
+                    source_port: args.source_port(sequence),
+                    destination_port: args.dest_port,
+                    reserved: 0,
+                    flags: Flags {
+                        hmac: false,
+                        xtea: false,
+                        rdp: false,
+                        crc: !args.no_crc,
+                    },
+                },
+                payload: payload.to_vec(),
+            })?,
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<Option<Reply>> {
+        match self {
+            Self::Kiss { port, decoder } => {
+                // Consume at most one frame per poll so traffic cannot starve deadlines.
+                for _ in 0..port.bytes_to_read()?.min(8192) {
+                    let mut byte = [0];
+                    port.read_exact(&mut byte)?;
+                    if let Some(frame) = decoder.feed(byte[0]) {
+                        return Ok(kiss::Packet::from_kiss(&frame).ok().map(|packet| Reply {
+                            source: packet.source(),
+                            destination: packet.destination(),
+                            sport: packet.source_port(),
+                            dport: packet.destination_port(),
+                            flags: packet.flags(),
+                            payload: packet.payload().to_vec(),
+                        }));
+                    }
+                }
+                Ok(None)
+            }
+            Self::Legacy { rx, .. } => Ok(rx.try_receive()?.map(|packet| Reply {
+                source: packet.header.source_address.into(),
+                destination: packet.header.destination_address.into(),
+                sport: packet.header.source_port,
+                dport: packet.header.destination_port,
+                flags: u8::from(packet.header.flags.crc)
+                    | (u8::from(
+                        packet.header.flags.hmac
+                            || packet.header.flags.xtea
+                            || packet.header.flags.rdp,
+                    ) << 1),
+                payload: packet.payload,
+            })),
+        }
+    }
+}
+
+fn payload(nonce: &[u8; 8], sequence: usize, length: usize) -> Vec<u8> {
+    let mut data: Vec<u8> = (0..length).map(|n| n as u8).collect();
+    data[..8].copy_from_slice(nonce);
+    data[8..16].copy_from_slice(&(sequence as u64).to_be_bytes());
+    data
+}
+
+#[derive(Default)]
 struct Stats {
-    sent_packets: AtomicU64,
-    recv_packets: AtomicU64,
-    recv_bytes: AtomicU64,
-    out_of_order_packets: AtomicU64,
-    lost_packets: AtomicU64,
-    mutex: Mutex<NonAtomicStats>,
-}
-
-#[derive(Debug)]
-struct NonAtomicStats {
-    rtts: Vec<Duration>,
+    sent: Vec<(Instant, bool)>,
+    received: usize,
+    duplicate: usize,
+    reordered: usize,
+    late: usize,
+    ignored: usize,
+    highest: Option<usize>,
+    rtt_sum: f64,
+    rtt_min: Option<f64>,
+    rtt_max: f64,
 }
 
 impl Stats {
-    fn new() -> Stats {
-        Stats {
-            sent_packets: AtomicU64::new(0),
-            recv_packets: AtomicU64::new(0),
-            out_of_order_packets: AtomicU64::new(0),
-            lost_packets: AtomicU64::new(0),
-            recv_bytes: AtomicU64::new(0),
-            mutex: Mutex::new(NonAtomicStats {
-                rtts: Vec::with_capacity(1024),
-            }),
-        }
-    }
-}
-
-struct Transmitter {
-    args: Args,
-    bytes_per_second: f64,
-    start: Instant,
-    transmitted_bytes: usize,
-    source_port: u8,
-    sequence_number: u64,
-    interface: CspInterface,
-    stats: Arc<Stats>,
-}
-
-impl Transmitter {
-    fn new(interface: CspInterface, args: Args, stats: Arc<Stats>) -> Transmitter {
-        let bytes_per_second = args.tx_rate() / 8.0;
-        let source_port = args.src_port.unwrap_or(args.csp_port_max_bind);
-        Transmitter {
-            args,
-            bytes_per_second,
-            start: Instant::now(),
-            transmitted_bytes: 0,
-            source_port,
-            sequence_number: 0,
-            interface,
-            stats,
-        }
-    }
-
-    fn run(&mut self) -> Result<()> {
-        loop {
-            self.send_one_packet()?;
-        }
-    }
-
-    fn send_one_packet(&mut self) -> Result<()> {
-        // wait to transmit before formatting packet, since the packet payload
-        // contains the TX timestamp for RTT measurement
-        self.wait_to_transmit();
-        let packet = self.format_packet();
-        self.interface.send(&packet)?;
-        let packet_len = packet.csp_len();
-        self.stats.sent_packets.fetch_add(1, Relaxed);
-        self.transmitted_bytes += packet_len;
-        self.sequence_number = self.sequence_number.wrapping_add(1);
-        if self.args.src_port.is_none() {
-            self.increment_source_port();
-        }
-        Ok(())
-    }
-
-    fn format_packet(&self) -> Packet {
-        let payload_len = self.args.packet_size - self.args.overhead();
-        let mut payload: Vec<u8> = (0..payload_len).map(|x| x as u8).collect();
-        if self.args.request_has_timestamp() {
-            // embed TX timestamp in payload
-            let timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap();
-            payload[..std::mem::size_of::<u64>()]
-                .copy_from_slice(&u64::try_from(timestamp.as_nanos()).unwrap().to_be_bytes());
-        }
-        if self.args.request_has_sequence_number() {
-            // embed sequence number in payload
-            payload[std::mem::size_of::<u64>()..2 * std::mem::size_of::<u64>()]
-                .copy_from_slice(&self.sequence_number.to_be_bytes());
-        }
-        Packet {
-            via: self.args.via_addr,
-            header: Header {
-                priority: Priority::Normal,
-                source_address: self.args.src_addr,
-                destination_address: self.args.dest_addr,
-                destination_port: self.args.dest_port,
-                source_port: self.source_port,
-                reserved: 0,
-                flags: Flags {
-                    hmac: false,
-                    xtea: false,
-                    rdp: false,
-                    crc: !self.args.no_crc,
-                },
-            },
-            payload,
-        }
-    }
-
-    fn wait_to_transmit(&self) {
-        let transmit_when = self.start
-            + Duration::from_secs_f64(self.transmitted_bytes as f64 / self.bytes_per_second);
-        if let Some(to_sleep) = transmit_when.checked_duration_since(Instant::now()) {
-            std::thread::sleep(to_sleep);
-        }
-    }
-
-    fn increment_source_port(&mut self) {
-        self.source_port += 1;
-        if self.source_port == 64 {
-            self.source_port = self.args.csp_port_max_bind;
-        }
-    }
-}
-
-struct Receiver {
-    interface: CspInterface,
-    args: Args,
-    stats: Arc<Stats>,
-    expected_sequence: u64,
-}
-
-impl Receiver {
-    fn new(interface: CspInterface, args: Args, stats: Arc<Stats>) -> Receiver {
-        Receiver {
-            interface,
-            args,
-            stats,
-            expected_sequence: 0,
-        }
-    }
-
-    fn run(&mut self) -> Result<()> {
-        loop {
-            self.receive_one_packet()?;
-        }
-    }
-
-    fn receive_one_packet(&mut self) -> Result<()> {
-        let packet = self.interface.receive()?;
-        if packet.header.destination_address != self.args.src_addr {
-            // not addressed to us; ignore the packet
-            return Ok(());
-        }
-        if packet.header.source_port != self.args.dest_port {
-            // not a ping reply; ignore the packet
-            return Ok(());
-        }
-        if self.args.request_has_timestamp() && packet.payload.len() >= std::mem::size_of::<u64>() {
-            // read embedded TX timestamp from payload
-            let timestamp = SystemTime::UNIX_EPOCH
-                + Duration::from_nanos(u64::from_be_bytes(
-                    packet.payload[..std::mem::size_of::<u64>()]
-                        .try_into()
-                        .unwrap(),
-                ));
-            // set round-trip-time to zero if for some reason the packet
-            // "travels back in time"
-            let rtt = SystemTime::now()
-                .duration_since(timestamp)
-                .unwrap_or_default();
-            self.stats.mutex.lock().unwrap().rtts.push(rtt);
-        }
-        if self.args.request_has_sequence_number()
-            && packet.payload.len() >= 2 * std::mem::size_of::<u64>()
+    fn reply(&mut self, args: &Args, nonce: &[u8; 8], reply: Reply, now: Instant) {
+        let data = &reply.payload;
+        if reply.source != args.dest_addr
+            || reply.destination != args.src_addr
+            || reply.sport != args.dest_port
+            || reply.flags != u8::from(!args.no_crc)
+            || data.len() != args.reply_size() - args.overhead()
+            || &data[..8] != nonce
         {
-            // read embedded sequence number from payload
-            let sequence = u64::from_be_bytes(
-                packet.payload[std::mem::size_of::<u64>()..2 * std::mem::size_of::<u64>()]
-                    .try_into()
-                    .unwrap(),
-            );
-            match sequence.cmp(&self.expected_sequence) {
-                Ordering::Less => {
-                    // packet arrived out of order
-                    self.stats.out_of_order_packets.fetch_add(1, Relaxed);
-                }
-                Ordering::Greater => {
-                    // lost packets
-                    self.stats
-                        .lost_packets
-                        .fetch_add(sequence - self.expected_sequence, Relaxed);
-                    self.expected_sequence = sequence + 1;
-                }
-                Ordering::Equal => {
-                    self.expected_sequence = sequence + 1;
-                }
-            };
+            self.ignored += 1;
+            return;
         }
-        self.stats.recv_packets.fetch_add(1, Relaxed);
-        self.stats
-            .recv_bytes
-            .fetch_add(u64::try_from(packet.csp_len()).unwrap(), Relaxed);
-        Ok(())
-    }
-}
-
-struct Monitor {
-    args: Args,
-    stats: Arc<Stats>,
-    last_update: Instant,
-}
-
-impl Monitor {
-    fn new(args: Args, stats: Arc<Stats>) -> Monitor {
-        Monitor {
-            args,
-            stats,
-            last_update: Instant::now(),
+        let sequence = u64::from_be_bytes(data[8..16].try_into().unwrap());
+        if sequence >= self.sent.len() as u64 {
+            self.ignored += 1;
+            return;
         }
-    }
-
-    fn run(&mut self) {
-        loop {
-            let next_update = self.last_update + Duration::from_secs_f64(self.args.stats_period);
-            if let Some(to_sleep) = next_update.checked_duration_since(Instant::now()) {
-                std::thread::sleep(to_sleep);
-            }
-            self.print_stats();
+        let sequence = sequence as usize;
+        if reply.dport != args.source_port(sequence)
+            || *data != payload(nonce, sequence, data.len())
+        {
+            self.ignored += 1;
+            return;
         }
-    }
-
-    fn print_stats(&mut self) {
-        // collect data
-        let system_time = SystemTime::now();
-        let now = Instant::now();
-        let tx_packets = self.stats.sent_packets.swap(0, Relaxed);
-        let rx_packets = self.stats.recv_packets.swap(0, Relaxed);
-        let rx_bytes = self.stats.recv_bytes.swap(0, Relaxed);
-        let out_of_order_packets = self.stats.out_of_order_packets.swap(0, Relaxed);
-        let lost_packets = self.stats.lost_packets.swap(0, Relaxed);
-        let rtts = self
-            .stats
-            .mutex
-            .lock()
-            .unwrap()
-            .rtts
-            .drain(..)
-            .collect::<Vec<_>>();
-
-        // compute
-        let elapsed = (now - self.last_update).as_secs_f64();
-        let tx_rate =
-            (tx_packets * u64::try_from(self.args.packet_size).unwrap() * 8) as f64 / elapsed;
-        let rx_rate = (rx_bytes * 8) as f64 / elapsed;
-        let timestamp = humantime::format_rfc3339(system_time);
-        let max_rtt = rtts.iter().copied().max().unwrap_or_default();
-        let min_rtt = rtts.iter().copied().min().unwrap_or_default();
-        let avg_rtt = if !rtts.is_empty() {
-            Duration::from_secs_f64(
-                rtts.iter()
-                    .map(|duration| duration.as_secs_f64())
-                    .sum::<f64>()
-                    / rtts.len() as f64,
-            )
-        } else {
-            Duration::default()
-        };
-
-        // format and print
-        let timestamp = console::style(format!("{timestamp}")).dim();
-        let tx = console::style("TX").red().bold();
-        let rx = console::style("RX").green().bold();
-        let rtt = console::style("RTT").blue().bold();
-        let tx_rate = human_bandwidth::format_bandwidth(Bandwidth::from_gbps_f64(tx_rate * 1e-9));
-        let rx_rate = human_bandwidth::format_bandwidth(Bandwidth::from_gbps_f64(rx_rate * 1e-9));
-        let packets = console::style("packets").dim();
-        let max_rtt_ms = max_rtt.as_secs_f64() * 1e3;
-        let min_rtt_ms = min_rtt.as_secs_f64() * 1e3;
-        let avg_rtt_ms = avg_rtt.as_secs_f64() * 1e3;
-        let ms = console::style("ms").dim();
-        let lost = if lost_packets > 0 {
-            format!(" {} {lost_packets}", console::style("lost").red().bold())
-        } else {
-            String::new()
-        };
-        let out_of_order = if out_of_order_packets > 0 {
-            format!(
-                " {} {out_of_order_packets}",
-                console::style("out-of-order").yellow().bold()
-            )
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "{timestamp} \
-             {tx} {tx_rate} {tx_packets} {packets} \
-             {rx} {rx_rate} {rx_packets} {packets} \
-             {rtt} {min_rtt_ms:.3}/{avg_rtt_ms:.3}/{max_rtt_ms:.3} {ms}{lost}{out_of_order}"
+        let (sent, received) = &mut self.sent[sequence];
+        if *received {
+            self.duplicate += 1;
+            return;
+        }
+        let rtt = now.duration_since(*sent).as_secs_f64();
+        if rtt > args.reply_timeout {
+            self.late += 1;
+            return;
+        }
+        *received = true;
+        self.received += 1;
+        if self.highest.is_some_and(|highest| sequence < highest) {
+            self.reordered += 1;
+        }
+        self.highest = Some(
+            self.highest
+                .map_or(sequence, |highest| highest.max(sequence)),
         );
-
-        self.last_update = now;
+        self.rtt_sum += rtt;
+        self.rtt_min = Some(self.rtt_min.map_or(rtt, |minimum| minimum.min(rtt)));
+        self.rtt_max = self.rtt_max.max(rtt);
     }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    anyhow::ensure!(
-        args.packet_size >= args.overhead(),
-        "Packet size is too small"
-    );
-
-    let (tx_interface, rx_interface) = open_csp_interfaces(
-        args.can.as_ref(),
-        &args.zmq_tx_socket,
-        &args.zmq_rx_socket,
-        args.src_addr,
-    )?;
-
-    let (tx_error, rx_error) = std::sync::mpsc::sync_channel(0);
-    let stats = Arc::new(Stats::new());
-
-    let mut receiver = Receiver::new(rx_interface, args.clone(), stats.clone());
-    std::thread::spawn({
-        let tx_error = tx_error.clone();
-        move || tx_error.send(receiver.run())
+    args.validate()?;
+    let mut nonce = [0; 8];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    let mut transport = Transport::open(&args).context("open CSP transport")?;
+    let mut stats = Stats::default();
+    let start = Instant::now();
+    let end_tx = start + Duration::from_secs_f64(args.duration);
+    let finish = end_tx + Duration::from_secs_f64(args.reply_timeout);
+    let interval = Duration::from_secs_f64(args.packet_size as f64 / args.rate());
+    let mut next_tx = start;
+    let mut next_stats = start + Duration::from_secs_f64(args.stats_period);
+    while Instant::now() < finish {
+        let now = Instant::now();
+        if now >= next_tx && now < end_tx && stats.sent.len() < 1_000_000 {
+            let sequence = stats.sent.len();
+            transport
+                .send(
+                    &args,
+                    sequence,
+                    &payload(&nonce, sequence, args.packet_size - args.overhead()),
+                )
+                .context("send CSP request")?;
+            stats.sent.push((now, false));
+            next_tx = Instant::now() + interval;
+        }
+        if let Some(reply) = transport.poll().context("receive CSP reply")? {
+            stats.reply(&args, &nonce, reply, Instant::now());
+        } else {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        if now >= next_stats {
+            eprintln!(
+                "sent={} received={} pending={}",
+                stats.sent.len(),
+                stats.received,
+                stats.sent.len() - stats.received
+            );
+            next_stats = now + Duration::from_secs_f64(args.stats_period);
+        }
+    }
+    let lost = stats.sent.len() - stats.received;
+    let elapsed = start.elapsed().as_secs_f64();
+    let result = json!({
+        "transport": if args.device.is_some() { "csp2-kiss" } else if args.can.is_some() { "csp1-can" } else { "csp1-zmq" },
+        "sent": stats.sent.len(), "received": stats.received, "lost": lost,
+        "duplicates": stats.duplicate, "reordered": stats.reordered, "late": stats.late, "ignored": stats.ignored,
+        "tx_seconds": args.duration, "elapsed_seconds": elapsed,
+        "tx_csp_bytes_per_second": stats.sent.len() as f64 * args.packet_size as f64 / args.duration,
+        "rx_csp_bytes_per_second": stats.received as f64 * args.reply_size() as f64 / elapsed,
+        "rx_payload_bytes_per_second": stats.received as f64 * (args.reply_size() - args.overhead()) as f64 / elapsed,
+        "rtt_min_ms": stats.rtt_min.map(|rtt| rtt * 1000.0),
+        "rtt_mean_ms": (stats.received > 0).then(|| stats.rtt_sum * 1000.0 / stats.received as f64),
+        "rtt_max_ms": (stats.received > 0).then_some(stats.rtt_max * 1000.0),
     });
+    if args.json {
+        println!("{result}");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    if lost > 0 {
+        std::process::exit(2);
+    }
+    Ok(())
+}
 
-    let mut transmitter = Transmitter::new(tx_interface, args.clone(), stats.clone());
-    std::thread::spawn({
-        let tx_error = tx_error.clone();
-        move || tx_error.send(transmitter.run())
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut monitor = Monitor::new(args, stats);
-    std::thread::spawn(move || monitor.run());
+    fn args(extra: &[&str]) -> Args {
+        Args::parse_from(
+            [
+                "csp-iperf",
+                "--device",
+                "/unused",
+                "--dest-addr",
+                "1",
+                "--tx-rate",
+                "640",
+            ]
+            .into_iter()
+            .chain(extra.iter().copied()),
+        )
+    }
 
-    rx_error.recv().unwrap()
+    #[test]
+    fn invalid_parameters_fail_before_open() {
+        for extra in [
+            vec!["--duration", "NaN"],
+            vec!["--reply-timeout", "0"],
+            vec!["--packet-size", "25"],
+            vec!["--src-port", "64"],
+            vec!["--no-crc"],
+            vec!["--packet-size", "4093"],
+        ] {
+            assert!(args(&extra).validate().is_err(), "{extra:?}");
+        }
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e100] {
+            let mut args = args(&[]);
+            args.tx_rate = Some(rate);
+            assert!(args.validate().is_err());
+        }
+    }
+
+    fn reply(args: &Args, sequence: usize) -> Reply {
+        Reply {
+            source: 1,
+            destination: 30,
+            sport: 1,
+            dport: args.source_port(sequence),
+            flags: 1,
+            payload: payload(&[7; 8], sequence, args.reply_size() - args.overhead()),
+        }
+    }
+
+    #[test]
+    fn reorder_duplicates_wrong_peer_corruption_and_tail_loss() {
+        let args = args(&[]);
+        let now = Instant::now();
+        let mut stats = Stats {
+            sent: vec![(now, false); 4],
+            ..Stats::default()
+        };
+        let mut wrong = reply(&args, 0);
+        wrong.source = 3;
+        stats.reply(&args, &[7; 8], wrong, now);
+        let mut corrupt = reply(&args, 0);
+        corrupt.payload[20] ^= 1;
+        stats.reply(&args, &[7; 8], corrupt, now);
+        for sequence in [2, 0, 2] {
+            stats.reply(&args, &[7; 8], reply(&args, sequence), now);
+        }
+        assert_eq!(
+            (
+                stats.received,
+                stats.reordered,
+                stats.duplicate,
+                stats.ignored
+            ),
+            (2, 1, 1, 2)
+        );
+        assert_eq!(stats.sent.len() - stats.received, 2);
+    }
+
+    #[test]
+    fn silence_and_late_replies_remain_lost() {
+        let args = args(&[]);
+        let now = Instant::now();
+        let mut stats = Stats {
+            sent: vec![(now, false); 2],
+            ..Stats::default()
+        };
+        assert_eq!(stats.sent.len() - stats.received, 2);
+        stats.reply(
+            &args,
+            &[7; 8],
+            reply(&args, 0),
+            now + Duration::from_secs(2),
+        );
+        assert_eq!((stats.received, stats.late), (0, 1));
+    }
 }
